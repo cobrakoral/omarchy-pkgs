@@ -438,10 +438,10 @@ index b35b42d..80b32c6 100644
 +qs_test(omarchyscannerthread omarchyscannerthread.cpp)
 diff --git c/src/core/test/omarchyscannerthread.cpp i/src/core/test/omarchyscannerthread.cpp
 new file mode 100644
-index 0000000..a8f8f64
+index 0000000..0000000
 --- /dev/null
 +++ i/src/core/test/omarchyscannerthread.cpp
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,109 @@
 +// Regression for OmarchyLoadPatch: URL interception may run on several threads.
 +// This deliberately exercises the production QmlScanner and QsUrlInterceptor.
 +#include <atomic>
@@ -453,6 +453,7 @@ index 0000000..a8f8f64
 +#include <qfile.h>
 +#include <qguiapplication.h>
 +#include <qlogging.h>
++#include <qstring.h>
 +#include <qtemporarydir.h>
 +#include <qurl.h>
 +
@@ -469,6 +470,9 @@ index 0000000..a8f8f64
 +    if (!temp.isValid()) return 2;
 +    const auto rootPath = temp.filePath("root");
 +    const auto outsidePath = temp.filePath("external-plugins");
++    const auto pluginDir = [&](int thread, int index) {
++        return outsidePath + QString("/plugin-%1-%2").arg(thread).arg(index);
++    };
 +    if (!QDir().mkpath(rootPath) || !QDir().mkpath(outsidePath)) return 3;
 +    const auto rootFile = rootPath + "/shell.qml";
 +    if (!writeFile(rootFile, "//@ pragma OmarchyLoadPatch\nimport QtQuick\nQtObject {}\n"))
@@ -482,7 +486,7 @@ index 0000000..a8f8f64
 +        "Item { Helper {} ; Child {} }\n";
 +    for (int t = 0; t < threadCount; ++t) {
 +        for (int i = 0; i < dirsPerThread; ++i) {
-+            const auto dir = outsidePath + QString("/plugin-%1-%2").arg(t).arg(i);
++            const auto dir = pluginDir(t, i);
 +            if (!QDir().mkpath(dir + "/sub")
 +                || !writeFile(dir + "/Widget.qml", content)
 +                || !writeFile(dir + "/Helper.qml", "import QtQuick\nItem {}\n")
@@ -504,8 +508,7 @@ index 0000000..a8f8f64
 +        threads.emplace_back([&, t]() {
 +            start.arrive_and_wait();
 +            for (int i = 0; i < dirsPerThread; ++i) {
-+                const auto path = outsidePath
-+                    + QString("/plugin-%1-%2/Widget.qml").arg(t).arg(i);
++                const auto path = pluginDir(t, i) + "/Widget.qml";
 +                const auto rewritten = generation->urlInterceptor.intercept(
 +                    QUrl::fromLocalFile(path), QQmlAbstractUrlInterceptor::QmlFile
 +                );
@@ -515,14 +518,38 @@ index 0000000..a8f8f64
 +    }
 +    for (auto& thread: threads) thread.join();
 +
++    // Verify the transformations, not merely that interception changed the URL scheme.
++    const auto expectedRoot =
++        QStringLiteral("//@ pragma OmarchyLoadPatch\nimport QtQuick 6.11\nQtObject {}\n");
++    const auto expectedWidget = QStringLiteral(
++        "import QtQuick 6.11\nimport \"sub\"\n"
++        "//@ if hasQtVersion(99, 0)\n// MASKED: BrokenType {}\n//@ endif\n"
++        "Item { Helper {} ; Child {} }\n"
++    );
++    const auto expectedType = QStringLiteral("import QtQuick 6.11\nItem {}\n");
++    const auto& rewrites = generation->scanner.fileIntercepts;
++    int contentFailures = rewrites.value(rootFile) != expectedRoot ? 1 : 0;
++    for (int t = 0; t < threadCount; ++t) {
++        for (int i = 0; i < dirsPerThread; ++i) {
++            const auto dir = pluginDir(t, i);
++            if (rewrites.value(dir + "/Widget.qml") != expectedWidget) ++contentFailures;
++            if (rewrites.value(dir + "/Helper.qml") != expectedType) ++contentFailures;
++            if (rewrites.value(dir + "/sub/Child.qml") != expectedType) ++contentFailures;
++        }
++    }
++
 +    const auto dirCount = generation->scanner.scannedDirs.size();
-+    const auto rewrittenCount = generation->scanner.fileIntercepts.size();
++    const auto rewrittenCount = rewrites.size();
++    const auto scanErrors = generation->scanner.scanErrors.size();
 +    qInfo().noquote() << "SCANNER_REGRESSION threads" << threadCount
 +                       << "directories" << dirCount
 +                       << "rewrites" << rewrittenCount
-+                       << "failures" << failures.load();
++                       << "interceptFailures" << failures.load()
++                       << "contentFailures" << contentFailures
++                       << "scanErrors" << scanErrors;
 +    generation->destroy();
-+    return failures.load() == 0 && dirCount >= threadCount * dirsPerThread ? 0 : 7;
++    return failures.load() == 0 && contentFailures == 0 && scanErrors == 0
++               && dirCount >= threadCount * dirsPerThread ? 0 : 7;
 +}
 diff --git c/src/launch/launch.cpp i/src/launch/launch.cpp
 index 1edd60c..f2542ae 100644
